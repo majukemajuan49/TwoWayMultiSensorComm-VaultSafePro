@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VaultSafe Pro - Control Center</title>
+    <!-- Library MQTT over WebSocket & Chart.js -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #0b0f19;
+            color: #f1f5f9;
+            margin: 0;
+            padding: 24px;
+        }
+        .container { max-width: 960px; margin: 0 auto; }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #1e293b;
+            padding-bottom: 16px;
+            margin-bottom: 24px;
+        }
+        .status-badge {
+            padding: 8px 18px;
+            border-radius: 9999px;
+            font-weight: 700;
+            font-size: 14px;
+            letter-spacing: 0.5px;
+        }
+        .status-safe { background: #064e3b; color: #34d399; border: 1px solid #059669; }
+        .status-tamper { background: #78350f; color: #fde047; border: 1px solid #d97706; }
+        .status-breach { 
+            background: #7f1d1d; 
+            color: #fca5a5; 
+            border: 1px solid #dc2626; 
+            animation: pulse-red 1s infinite alternate; 
+        }
+        @keyframes pulse-red {
+            from { opacity: 1; transform: scale(1); }
+            to { opacity: 0.75; transform: scale(1.03); }
+        }
+        .grid-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .card {
+            background: #111827;
+            border: 1px solid #1f2937;
+            padding: 18px;
+            border-radius: 12px;
+        }
+        .card-title { font-size: 12px; color: #9ca3af; text-transform: uppercase; font-weight: 600; margin-bottom: 6px; }
+        .card-value { font-size: 26px; font-weight: 800; color: #ffffff; }
+        .chart-box {
+            background: #111827;
+            border: 1px solid #1f2937;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+        }
+        .control-panel {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        button {
+            padding: 16px;
+            font-size: 15px;
+            font-weight: 700;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .btn-alarm { background: #dc2626; color: white; }
+        .btn-alarm:hover { background: #b91c1c; }
+        .btn-beep { background: #2563eb; color: white; }
+        .btn-beep:hover { background: #1d4ed8; }
+        .connection-status { font-size: 13px; color: #9ca3af; margin-top: 4px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1 style="margin: 0; font-size: 24px;">VaultSafe Pro Dashboard</h1>
+                <div id="mqttStatus" class="connection-status">Menghubungkan ke broker...</div>
+            </div>
+            <div id="threatBadge" class="status-badge status-safe">STATUS: MENUNGGU DATA</div>
+        </div>
+
+        <div class="grid-cards">
+            <div class="card">
+                <div class="card-title">Threat Score (0-100)</div>
+                <div id="cardScore" class="card-value">0</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Cahaya Saat Ini</div>
+                <div id="cardLux" class="card-value">0.0 <span style="font-size:14px;color:#9ca3af;">Lux</span></div>
+            </div>
+            <div class="card">
+                <div class="card-title">Laju Cahaya (&Delta;Lux/dtk)</div>
+                <div id="cardLuxRate" class="card-value">0.0</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Motion Jerk</div>
+                <div id="cardJerk" class="card-value">0.0</div>
+            </div>
+        </div>
+
+        <div class="chart-box">
+            <h3 style="margin-top: 0; font-size: 16px; color: #e2e8f0;">Grafik Sensor Real-Time (30 Sampel Terakhir)</h3>
+            <canvas id="sensorChart" height="90"></canvas>
+        </div>
+
+        <h3 style="margin-bottom: 12px; font-size: 16px; color: #e2e8f0;">Kontrol Balik 2 Arah (Downlink ke Edge 1)</h3>
+        <div class="control-panel">
+            <button class="btn-alarm" onclick="sendDownlink('TRIGGER_ALARM')">🚨 Picu Senter & Sirine Darurat</button>
+            <button class="btn-beep" onclick="sendDownlink('BEEP')">🔔 Kirim Sinyal Beep Konfirmasi</button>
+        </div>
+    </div>
+
+    <script>
+        // Samakan GROUP_TAG persis dengan yang ada di hp_laci.py dan hp_pemilik.py
+        const GROUP_TAG = "kelompok_iot_vault_01";
+        
+        // WebSocket EMQX over TLS (Port 8084)
+        const WSS_BROKER = "wss://broker.emqx.io:8084/mqtt";
+        const TOPIC_TELEMETRY = `vaultsafe/${GROUP_TAG}/edge1/telemetry`;
+        const TOPIC_COMMANDS = `vaultsafe/${GROUP_TAG}/commands`;
+
+        // Inisialisasi Grafik Chart.js
+        const ctx = document.getElementById('sensorChart').getContext('2d');
+        const sensorChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Laju Cahaya (Lux/s)',
+                        data: [],
+                        borderColor: '#fbbf24',
+                        backgroundColor: 'rgba(251, 191, 36, 0.1)',
+                        tension: 0.25,
+                        fill: true
+                    },
+                    {
+                        label: 'Motion Jerk',
+                        data: [],
+                        borderColor: '#38bdf8',
+                        backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                        tension: 0.25,
+                        fill: true
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                animation: false,
+                scales: {
+                    x: { ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' } },
+                    y: { ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' }, beginAtZero: true }
+                },
+                plugins: {
+                    legend: { labels: { color: '#e2e8f0' } }
+                }
+            }
+        });
+
+        // Hubungkan ke Broker via WebSocket
+        const clientId = "dashboard_" + Math.random().toString(16).substring(2, 8);
+        const client = mqtt.connect(WSS_BROKER, { clientId: clientId });
+
+        client.on('connect', () => {
+            document.getElementById('mqttStatus').innerText = "🟢 Terhubung ke Broker Cloud (broker.emqx.io)";
+            client.subscribe(TOPIC_TELEMETRY, (err) => {
+                if (!err) console.log("Subscribed ke:", TOPIC_TELEMETRY);
+            });
+        });
+
+        client.on('error', (err) => {
+            document.getElementById('mqttStatus').innerText = "🔴 Gagal tersambung: " + err.message;
+        });
+
+        // Tangani Pesan Masuk (Uplink dari HP 1)
+        client.on('message', (topic, message) => {
+            try {
+                const parsed = JSON.parse(message.toString());
+                const metrics = parsed.metrics;
+
+                // Perbarui Teks Kartu Metrik
+                document.getElementById('cardScore').innerText = metrics.score;
+                document.getElementById('cardLux').innerHTML = metrics.current_lux + ' <span style="font-size:14px;color:#9ca3af;">Lux</span>';
+                document.getElementById('cardLuxRate').innerText = metrics.lux_rate;
+                document.getElementById('cardJerk').innerText = metrics.jerk;
+
+                // Perbarui Badge Status
+                const badge = document.getElementById('threatBadge');
+                badge.innerText = "STATUS: " + metrics.status;
+                badge.className = "status-badge " + 
+                    (metrics.status === "SAFE" ? "status-safe" : 
+                     metrics.status === "TAMPER_WARNING" ? "status-tamper" : "status-breach");
+
+                // Perbarui Data Grafik (Maksimal 30 titik data)
+                const now = new Date().toLocaleTimeString();
+                if (sensorChart.data.labels.length >= 30) {
+                    sensorChart.data.labels.shift();
+                    sensorChart.data.datasets[0].data.shift();
+                    sensorChart.data.datasets[1].data.shift();
+                }
+                sensorChart.data.labels.push(now);
+                sensorChart.data.datasets[0].data.push(metrics.lux_rate);
+                sensorChart.data.datasets[1].data.push(metrics.jerk);
+                sensorChart.update();
+
+            } catch (e) {
+                console.error("Gagal membaca payload:", e);
+            }
+        });
+
+        // Fungsi Perintah Balik (Downlink 2 Arah)
+        function sendDownlink(actionName) {
+            const payload = JSON.stringify({ action: actionName });
+            client.publish(TOPIC_COMMANDS, payload, { qos: 1 });
+            console.log("Mengirim perintah downlink:", actionName);
+        }
+    </script>
+</body>
+</html>
