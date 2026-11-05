@@ -3,13 +3,11 @@ import math
 import subprocess
 import time
 import uuid
-import joblib
-import warnings
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 
-# Abaikan warning scikit-learn soal feature names
-warnings.filterwarnings("ignore", category=UserWarning)
+# Import "Otak" AI murni hasil m2cgen (tanpa butuh scikit-learn!)
+import model_ai_murni
 
 # ================= KONFIGURASI =================
 GROUP_TAG = "kelompok_iot_vault_01"
@@ -20,9 +18,9 @@ TOPIC_TELEMETRY = f"vaultsafe/{GROUP_TAG}/edge1/telemetry"
 TOPIC_ALERTS = f"vaultsafe/{GROUP_TAG}/alerts"
 TOPIC_COMMANDS = f"vaultsafe/{GROUP_TAG}/commands"
 
+# Sensor Termux (sesuaikan jika nama sensor di HP berbeda)
 ACCEL_SENSOR_NAME = "sc7a20e"
 LIGHT_SENSOR_NAME = "stk33562"
-MODEL_FILE = "vaultsafe_model.pkl"
 
 def read_sensors():
     try:
@@ -33,9 +31,10 @@ def read_sensors():
         lux = float(data[LIGHT_SENSOR_NAME]["values"][0])
         return time.time(), lux, accel
     except Exception:
+        # Fallback jika pembacaan gagal
         return time.time(), 0.0, (0.0, 0.0, 9.8)
 
-def evaluate_threat_ai(prev_sample, curr_sample, model):
+def evaluate_threat_ai(prev_sample, curr_sample):
     t_prev, lux_prev, accel_prev = prev_sample
     t_curr, lux_curr, accel_curr = curr_sample
     dt = max(t_curr - t_prev, 0.001)
@@ -45,14 +44,19 @@ def evaluate_threat_ai(prev_sample, curr_sample, model):
     mag_curr = math.sqrt(accel_curr[0]**2 + accel_curr[1]**2 + accel_curr[2]**2)
     jerk = abs(mag_curr - mag_prev) / dt
 
-    # 1. AI MENGAMBIL KEPUTUSAN BERDASARKAN POLA (Bukan lagi if-else kaku)
-    # Model menerima array 2D: [[Lux, Jerk]]
-    prediksi_ai = model.predict([[lux_curr, jerk]])[0]
+    # 1. Panggil fungsi pure Python dari m2cgen
+    # Ingat urutan fitur saat training: [Lux, Jerk]
+    input_fitur = [lux_curr, jerk]
+    raw_output = model_ai_murni.score(input_fitur)
 
-    # 2. Terjemahkan output AI (0, 1, 2) menjadi status
+    # 2. Ambil probabilitas tertinggi sebagai tebakan akhir AI
+    # raw_output berbentuk list, misal: [0.1, 0.2, 0.7] -> indeks 2 (BREACH) yang menang
+    prediksi_ai = raw_output.index(max(raw_output))
+
+    # 3. Terjemahkan prediksi (0, 1, 2) ke Status Sistem
     if prediksi_ai == 2:
         status = "BREACH_CRITICAL"
-        threat_score = 100 # Skor dummy agar grafik dashboard tetap jalan
+        threat_score = 100 # Skor untuk divisualisasikan di web dashboard
     elif prediksi_ai == 1:
         status = "TAMPER_WARNING"
         threat_score = 50
@@ -97,14 +101,8 @@ def on_message(client, userdata, msg, *args):
         print(f"Error parse: {e}")
 
 def main():
-    print(f"[INFO] Memuat model AI dari {MODEL_FILE}...")
-    try:
-        ai_model = joblib.load(MODEL_FILE)
-        print("[INFO] Model AI berhasil dimuat!")
-    except Exception as e:
-        print(f"[ERROR] Gagal memuat model: {e}")
-        return
-
+    print("[INFO] Menyiapkan Edge Device VaultSafe Pro berbasis AI...")
+    
     unique_id = f"edge1_{uuid.uuid4().hex[:6]}"
     client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2, client_id=unique_id)
     client.on_connect = on_connect
@@ -121,18 +119,20 @@ def main():
             time.sleep(1.0)
             curr_sample = read_sensors()
             
-            # Panggil fungsi evaluasi yang sudah disuntikkan AI
-            analysis = evaluate_threat_ai(prev_sample, curr_sample, ai_model)
+            # Panggil fungsi evaluasi cerdas
+            analysis = evaluate_threat_ai(prev_sample, curr_sample)
             prev_sample = curr_sample
 
+            # Siapkan paket data (payload) ke dashboard
             telemetry = {
                 "device_id": "edge1_vault",
                 "timestamp": curr_sample[0],
                 "metrics": analysis
             }
             client.publish(TOPIC_TELEMETRY, json.dumps(telemetry), qos=0)
-            print(f"[AI STATUS] {analysis['status']} | Jerk: {analysis['jerk']} | Lux: {analysis['current_lux']}")
+            print(f"[AI STATUS] {analysis['status']:<15} | Jerk: {analysis['jerk']:<5} | Lux: {analysis['current_lux']}")
 
+            # Tembakkan ke Alert jika kondisi bahaya
             if analysis["status"] in ["BREACH_CRITICAL", "TAMPER_WARNING"]:
                 alert_payload = {
                     "alert_type": analysis["status"],
